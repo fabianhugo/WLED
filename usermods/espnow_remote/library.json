@@ -1,0 +1,5 @@
+{
+  "name": "espnow_remote",
+  "build": { "libArchive": false },
+  "dependencies": {}
+}

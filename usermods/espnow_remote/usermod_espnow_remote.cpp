@@ -58,22 +58,52 @@ static const char espnowRemoteDefaultPresetsJson[] PROGMEM = R"json({
   "1": {
     "n": "Idle Palette",
     "ql": "I",
-    "win": "&T=1&A=120&FX=65&SX=20&FP=0"
+    "on": true,
+    "bri": 120,
+    "seg": [
+      {
+        "id": 0,
+        "fx": 65,
+        "sx": 20,
+        "pal": 0
+      }
+    ]
   },
   "2": {
     "n": "Active Aurora",
     "ql": "A",
-    "win": "&T=1&A=200&FX=38&SX=24&FP=50"
+    "on": true,
+    "bri": 200,
+    "seg": [
+      {
+        "id": 0,
+        "fx": 38,
+        "sx": 24,
+        "pal": 50
+      }
+    ]
   },
   "3": {
     "n": "Warm Static",
     "ql": "W",
-    "win": "&T=1&A=160&R=255&G=120&B=20&FX=0"
+    "on": true,
+    "bri": 160,
+    "seg": [
+      {
+        "id": 0,
+        "fx": 0,
+        "col": [
+          [255, 120, 20],
+          [0, 0, 0],
+          [0, 0, 0]
+        ]
+      }
+    ]
   },
   "4": {
     "n": "Off",
     "ql": "O",
-    "win": "&T=0"
+    "on": false
   }
 })json";
 

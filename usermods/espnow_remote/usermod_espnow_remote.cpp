@@ -50,6 +50,32 @@
 #define ESPNOW_REMOTE_HEARTBEAT_MS  1000UL   // heartbeat interval
 #define ESPNOW_REMOTE_MAX_BUTTONS   4        // configurable GPIO buttons
 #define ESPNOW_REMOTE_DEBOUNCE_MS   50       // debounce window in ms
+#define ESPNOW_REMOTE_LONG_PRESS_MS 2000UL   // hold duration for AP toggle
+#define ESPNOW_REMOTE_DBL_PRESS_MS  260UL    // max gap between short presses
+
+static const char espnowRemoteDefaultPresetsJson[] PROGMEM = R"json({
+  "0": {},
+  "1": {
+    "n": "Idle Palette",
+    "ql": "I",
+    "win": "&T=1&A=120&FX=65&SX=20&FP=0"
+  },
+  "2": {
+    "n": "Active Aurora",
+    "ql": "A",
+    "win": "&T=1&A=200&FX=38&SX=24&FP=50"
+  },
+  "3": {
+    "n": "Warm Static",
+    "ql": "W",
+    "win": "&T=1&A=160&R=255&G=120&B=20&FX=0"
+  },
+  "4": {
+    "n": "Off",
+    "ql": "O",
+    "win": "&T=0"
+  }
+})json";
 
 class EspNowRemoteUsermod : public Usermod {
  private:
@@ -94,6 +120,37 @@ class EspNowRemoteUsermod : public Usermod {
   unsigned long lastPeerHeartbeat = 0;  // millis() of most recent received heartbeat
   bool presenceInitDone = false;        // set after first effect is applied in loop()
   uint8_t lastPeerMac[6] = {};          // MAC of the most recent heartbeat sender
+
+  // ── Control button (single = next favorite, double = ESP-NOW, long = AP) ─────
+  int8_t        controlPin      = 9;   // GPIO9 = BOOT button on ESP32-C3 Super Mini
+  bool          espNowListening = true;   // when false, incoming heartbeats are ignored and TX heartbeat is paused
+
+  bool          ctrlRaw         = false;
+  bool          ctrlStable      = false;
+  unsigned long ctrlRawChange   = 0;
+  unsigned long ctrlPressTime   = 0;      // millis() when stable press started
+  bool          ctrlLongFired   = false;  // prevents short-press action after long-press
+  bool          ctrlWaitSecond  = false;  // waiting for second short press
+  unsigned long ctrlLastRelease = 0;
+  bool          apForcedOff     = false;  // enforce AP off even if WLED tries to reopen it
+
+  // ── Cached quick-load favorites (presets with non-empty "ql") ──────────────
+  uint8_t       quickFavIds[250]   = {};
+  uint8_t       quickFavCount       = 0;
+  bool          quickFavCacheValid  = false;
+  unsigned long quickFavCacheSig    = 0;
+  int16_t       quickFavCursor      = -1;
+
+  // ── Blink feedback state machine ─────────────────────────────────────────────
+  enum BlinkPhase : uint8_t { BLINK_IDLE, BLINK_ON, BLINK_OFF, BLINK_RESTORE } blinkPhase = BLINK_IDLE;
+  uint8_t       blinkCount    = 0;
+  uint8_t       blinkTotal    = 3;
+  uint32_t      blinkColor    = 0;
+  unsigned long blinkTimer    = 0;
+  uint8_t       blinkSavedFx  = 0;
+  uint8_t       blinkSavedSpd = 0;
+  uint8_t       blinkSavedPal = 0;
+  uint32_t      blinkSavedCol = 0;
 
   // ── Misc ─────────────────────────────────────────────────────────────────────
   unsigned long lastHeartbeat = 0;
@@ -224,12 +281,202 @@ class EspNowRemoteUsermod : public Usermod {
     DEBUG_PRINTLN(F("EspNowRemote: heartbeat sent"));
   }
 
+  // Start a blink sequence (WRGB color, default 3 blinks).
+  // Saves main-segment state and restores it after the last blink.
+  void startBlink(uint32_t color, uint8_t count = 3) {
+    Segment& seg  = strip.getMainSegment();
+    blinkSavedFx  = seg.mode;
+    blinkSavedSpd = seg.speed;
+    blinkSavedPal = seg.palette;
+    blinkSavedCol = seg.colors[0];
+    blinkColor    = color;
+    blinkTotal    = count;
+    blinkCount    = 0;
+    blinkPhase    = BLINK_ON;
+    blinkTimer    = millis();
+    strip.setTransition(0);
+    seg.setMode(FX_MODE_STATIC, true);
+    seg.colors[0] = color;
+    stateUpdated(CALL_MODE_DIRECT_CHANGE);
+  }
+
+  // Drive the blink state machine — call every loop() iteration.
+  void updateBlink() {
+    if (blinkPhase == BLINK_IDLE) return;
+    unsigned long now = millis();
+    Segment& seg = strip.getMainSegment();
+    switch (blinkPhase) {
+      case BLINK_ON:
+        if (now - blinkTimer >= 150) {
+          seg.colors[0] = 0;
+          stateUpdated(CALL_MODE_DIRECT_CHANGE);
+          blinkPhase = BLINK_OFF;
+          blinkTimer = now;
+        }
+        break;
+      case BLINK_OFF:
+        if (now - blinkTimer >= 120) {
+          blinkCount++;
+          if (blinkCount >= blinkTotal) {
+            blinkPhase = BLINK_RESTORE;
+            blinkTimer = now;
+          } else {
+            seg.colors[0] = blinkColor;
+            stateUpdated(CALL_MODE_DIRECT_CHANGE);
+            blinkPhase = BLINK_ON;
+            blinkTimer = now;
+          }
+        }
+        break;
+      case BLINK_RESTORE:
+        if (now - blinkTimer >= 200) {
+          seg.setMode(blinkSavedFx, true);
+          seg.speed    = blinkSavedSpd;
+          seg.palette  = blinkSavedPal;
+          seg.colors[0] = blinkSavedCol;
+          stateUpdated(CALL_MODE_DIRECT_CHANGE);
+          blinkPhase = BLINK_IDLE;
+        }
+        break;
+      default: break;
+    }
+  }
+
+  // Short press: toggle ESP-NOW heartbeat reception.
+  // Yellow blink = listening OFF, green blink = listening ON.
+  void toggleEspNowListening() {
+    espNowListening = !espNowListening;
+    if (!espNowListening) {
+      lastPeerHeartbeat = 0;   // force transition to IDLE
+      presenceInitDone  = false;
+      startBlink(0x00FFFF00, 3);  // yellow = OFF
+    } else {
+      startBlink(0x0000FF00, 3);  // green  = ON
+    }
+    DEBUG_PRINTF_P(PSTR("EspNowRemote: listening %s\n"), espNowListening ? "ON" : "OFF");
+  }
+
+  // Rebuild quick-load preset cache when presets change.
+  bool refreshQuickLoadCache(bool force = false) {
+    if (!force && quickFavCacheValid && quickFavCacheSig == presetsModifiedTime) return true;
+    if (!requestJSONBufferLock(JSON_LOCK_PRESET_NAME)) return false;
+
+    quickFavCount = 0;
+    for (uint8_t i = 1; i <= 250; i++) {
+      if (!readObjectFromFileUsingId(getPresetsFileName(), i, pDoc)) continue;
+      JsonObject fdo = pDoc->as<JsonObject>();
+      if (!fdo["playlist"]["ps"].isNull()) continue;  // skip playlists
+
+      const char* ql = fdo["ql"] | "";
+      if (!(ql && ql[0])) continue;
+
+      if (quickFavCount < sizeof(quickFavIds)) {
+        quickFavIds[quickFavCount++] = i;
+      }
+    }
+    releaseJSONBufferLock();
+
+    quickFavCacheSig   = presetsModifiedTime;
+    quickFavCacheValid = true;
+    quickFavCursor     = -1;
+    return true;
+  }
+
+  // Seed bundled default presets if presets.json has no real presets yet.
+  bool seedDefaultPresetsIfEmpty() {
+    bool hasPreset = false;
+    if (!requestJSONBufferLock(JSON_LOCK_PRESET_NAME)) return false;
+
+    // AI: below section was generated by an AI
+    for (uint8_t i = 1; i <= 250; i++) {
+      if (readObjectFromFileUsingId(getPresetsFileName(), i, pDoc)) {
+        hasPreset = true;
+        break;
+      }
+    }
+    // AI: end
+
+    releaseJSONBufferLock();
+    if (hasPreset) return false;
+
+    char fileName[33];
+    strncpy_P(fileName, getPresetsFileName(), sizeof(fileName) - 1);
+    fileName[sizeof(fileName) - 1] = '\0';
+
+    File f = WLED_FS.open(fileName, "w");
+    if (!f) {
+      DEBUG_PRINTLN(F("EspNowRemote: failed to open presets.json for seeding"));
+      return false;
+    }
+    f.print(FPSTR(espnowRemoteDefaultPresetsJson));
+    f.close();
+
+    presetsModifiedTime = toki.second();
+    quickFavCacheValid  = false;
+    DEBUG_PRINTLN(F("EspNowRemote: seeded bundled default presets"));
+    return true;
+  }
+
+  // Advance through the four bundled presets only: 1 -> 2 -> 3 -> 4 -> 1.
+  void nextFavoritePreset() {
+    static const uint8_t bundledPresetIds[] = {1, 2, 3, 4};
+    const uint8_t presetCount = sizeof(bundledPresetIds);
+
+    if (quickFavCursor < 0 || quickFavCursor >= presetCount) {
+      quickFavCursor = 0;
+      for (uint8_t i = 0; i < presetCount; i++) {
+        if (bundledPresetIds[i] == currentPreset) {
+          quickFavCursor = (i + 1) % presetCount;
+          break;
+        }
+      }
+    }
+
+    uint8_t target = bundledPresetIds[quickFavCursor];
+    quickFavCursor = (quickFavCursor + 1) % presetCount;
+
+    presetCycCurr = target;
+    applyPreset(target, CALL_MODE_BUTTON_PRESET);
+    DEBUG_PRINTF_P(PSTR("EspNowRemote: next bundled preset %u\n"), (unsigned)target);
+  }
+
+  bool isApOn() {
+    uint8_t mode = (uint8_t)WiFi.getMode();
+    return apActive || ((mode & (uint8_t)WIFI_AP) != 0);
+  }
+
+  void stopAPNow() {
+    dnsServer.stop();
+    WiFi.softAPdisconnect(true);
+    apActive = false;
+  }
+
+  // Long press: toggle the WiFi soft AP via WLED's own AP machinery.
+  // Sets apBehavior so WLED's connection handler respects the intent across reconnects.
+  // Blue blink = AP ON, red blink = AP OFF.
+  void toggleAP() {
+    if (isApOn()) {
+      // Tear down AP the same way WLED does on STA connect.
+      stopAPNow();
+      apBehavior = AP_BEHAVIOR_BUTTON_ONLY;  // prevent WLED from re-opening it
+      apForcedOff = true;
+      startBlink(0x00FF0000, 3);  // red  = AP OFF
+    } else {
+      apBehavior = AP_BEHAVIOR_ALWAYS;        // tell WLED to keep AP open
+      WLED::instance().initAP();
+      apForcedOff = false;
+      startBlink(0x000000FF, 3);  // blue = AP ON
+    }
+    DEBUG_PRINTF_P(PSTR("EspNowRemote: AP %s\n"), isApOn() ? "ON" : "OFF");
+  }
+
   void configurePins() {
     for (int i = 0; i < ESPNOW_REMOTE_MAX_BUTTONS; i++) {
       if (buttonPins[i] >= 0) {
         pinMode(buttonPins[i], INPUT_PULLUP);
       }
     }
+    if (controlPin >= 0) pinMode(controlPin, INPUT_PULLUP);
   }
 
   // Apply the idle or active visual state.
@@ -270,7 +517,10 @@ class EspNowRemoteUsermod : public Usermod {
     // Ensure the ESP-NOW stack will be started (harmless if already enabled via cfg).
     enableESPNow = true;
 
+    apForcedOff = false;
+
     configurePins();
+    seedDefaultPresetsIfEmpty();
   }
 
   void loop() override {
@@ -279,18 +529,61 @@ class EspNowRemoteUsermod : public Usermod {
     unsigned long now = millis();
 
     // ── Heartbeat tx ─────────────────────────────────────────────────────────
-    if (now - lastHeartbeat >= ESPNOW_REMOTE_HEARTBEAT_MS) {
+    if (espNowListening && now - lastHeartbeat >= ESPNOW_REMOTE_HEARTBEAT_MS) {
       lastHeartbeat = now;
       sendHeartbeat();
+    }
+
+    // ── Blink state machine ───────────────────────────────────────────────────
+    updateBlink();
+
+    // ── Control button (single = next favorite, double = ESP-NOW, long = AP) ─
+    if (controlPin >= 0) {
+      bool raw = (digitalRead(controlPin) == LOW);
+      if (raw != ctrlRaw) {
+        ctrlRaw       = raw;
+        ctrlRawChange = now;
+      }
+      if ((now - ctrlRawChange) >= ESPNOW_REMOTE_DEBOUNCE_MS && raw != ctrlStable) {
+        ctrlStable = raw;
+        if (raw) {
+          ctrlPressTime = now;
+          ctrlLongFired = false;
+        } else if (!ctrlLongFired) {
+          if (ctrlWaitSecond && (now - ctrlLastRelease) <= ESPNOW_REMOTE_DBL_PRESS_MS) {
+            ctrlWaitSecond = false;
+            toggleEspNowListening();
+          } else {
+            ctrlWaitSecond  = true;
+            ctrlLastRelease = now;
+          }
+        }
+      }
+      if (ctrlStable && !ctrlLongFired && (now - ctrlPressTime) >= ESPNOW_REMOTE_LONG_PRESS_MS) {
+        ctrlLongFired = true;
+        ctrlWaitSecond = false;
+        toggleAP();  // long press while held
+      }
+
+      if (ctrlWaitSecond && (now - ctrlLastRelease) > ESPNOW_REMOTE_DBL_PRESS_MS) {
+        ctrlWaitSecond = false;
+        nextFavoritePreset();
+      }
+    }
+
+    // If AP was force-disabled, keep it off even when WLED connection logic re-opens it.
+    if (apForcedOff && isApOn()) {
+      stopAPNow();
     }
 
     // ── Presence state machine ────────────────────────────────────────────────
     bool peerAlive = lastPeerHeartbeat > 0 &&
                      (now - lastPeerHeartbeat) < (uint32_t)timeoutSec * 1000UL;
 
-    if (!presenceInitDone) {
+    if (blinkPhase != BLINK_IDLE) { /* skip presence changes during blink */ }
+    else if (!presenceInitDone) {
       // Apply initial effect once the strip is ready
-      presenceState   = peerAlive ? ACTIVE : IDLE;
+      presenceState    = peerAlive ? ACTIVE : IDLE;
       presenceInitDone = true;
       applyPresenceEffect(presenceState == ACTIVE);
     } else if (peerAlive && presenceState == IDLE) {
@@ -331,6 +624,7 @@ class EspNowRemoteUsermod : public Usermod {
   // receiving node stays in control of its own effect rather than being overwritten
   // by the sender's state.
   bool onEspNowMessage(uint8_t* sender, uint8_t* data, uint8_t len) override {
+    if (!espNowListening) return false;
     // Our heartbeat: outer wrapper = { 'W', 0, 1, ... }, inner data[0]=0 (notifier proto)
     if (len >= 5 && data[0] == 'W' && data[1] == 0 && data[3] == 0) {
       lastPeerHeartbeat = millis();
@@ -365,6 +659,8 @@ class EspNowRemoteUsermod : public Usermod {
     top["activePal"]    = activePalette;
     top["timeoutSec"]   = timeoutSec;
     top["transMs"]      = transitionMs;
+    top["controlPin"]   = controlPin;
+    top["listenEspNow"] = espNowListening;
   }
 
   bool readFromConfig(JsonObject& root) override {
@@ -400,6 +696,8 @@ class EspNowRemoteUsermod : public Usermod {
     configComplete &= getJsonValue(top["activePal"],    activePalette, (uint8_t)50);
     configComplete &= getJsonValue(top["timeoutSec"],   timeoutSec,    (uint16_t)45);
     configComplete &= getJsonValue(top["transMs"],      transitionMs,  (uint16_t)1500);
+    configComplete &= getJsonValue(top["controlPin"],   controlPin,    (int8_t)-1);
+    configComplete &= getJsonValue(top["listenEspNow"], espNowListening, true);
 
     // (Re)configure pins in case this is called after setup() on a settings save
     configurePins();

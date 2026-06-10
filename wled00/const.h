@@ -669,13 +669,15 @@ static_assert(WLED_MAX_BUSSES <= 32, "WLED_MAX_BUSSES exceeds hard limit");
 #endif
 
 // Defaults pins, type and counts to configure LED output
-#if defined(ESP8266) || defined(CONFIG_IDF_TARGET_ESP32C3)
+#if defined(ESP8266)
   #ifdef WLED_ENABLE_DMX
     #define DEFAULT_LED_PIN 1
     #warning "Compiling with DMX. The default LED pin has been changed to pin 1."
   #else
     #define DEFAULT_LED_PIN 2    // GPIO2 (D4) on Wemos D1 mini compatible boards, safe to use on any board
   #endif
+#elif defined(CONFIG_IDF_TARGET_ESP32C3)
+  #define DEFAULT_LED_PIN 4      // GPIO4 default for ESP32-C3 boards
 #else
   #if defined(WLED_USE_ETHERNET)
     #define DEFAULT_LED_PIN 4    // GPIO4 seems to be a "safe bet" for all known ethernet boards (issue #5155)

@@ -163,6 +163,7 @@ class EspNowRemoteUsermod : public Usermod {
   bool          ctrlWaitSecond  = false;  // waiting for second short press
   unsigned long ctrlLastRelease = 0;
   bool          apForcedOff     = false;  // enforce AP off even if WLED tries to reopen it
+  bool          wirelessDisabled = false;  // hard radio-off latch
 
   // ── Cached quick-load favorites (presets with non-empty "ql") ──────────────
   uint8_t       quickFavIds[250]   = {};
@@ -218,6 +219,7 @@ class EspNowRemoteUsermod : public Usermod {
   } PartialEspNowPkt_t;
 
   void sendWizMoteCommand(uint8_t button) {
+    if (!espNowListening) return;
     if (statusESPNow != ESP_NOW_STATE_ON) return;
 
     WizMoteMsg_t msg;
@@ -478,26 +480,51 @@ class EspNowRemoteUsermod : public Usermod {
   void stopAPNow() {
     dnsServer.stop();
     WiFi.softAPdisconnect(true);
+    WiFi.mode(WIFI_STA);
     apActive = false;
+  }
+
+  void disableWireless() {
+    if (statusESPNow == ESP_NOW_STATE_ON) {
+      quickEspNow.stop();
+      statusESPNow = ESP_NOW_STATE_UNINIT;
+    }
+    enableESPNow = false;
+    useESPNowSync = false;
+    espNowListening = false;
+    stopAPNow();
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+    forceReconnect = false;
+    lastReconnectAttempt = millis();
+    wirelessDisabled = true;
+    apForcedOff = true;
+  }
+
+  void enableWireless() {
+    wirelessDisabled = false;
+    apForcedOff = false;
+    enableESPNow = true;
+    useESPNowSync = true;
+    espNowListening = true;
+    apBehavior = AP_BEHAVIOR_ALWAYS;
+    forceReconnect = true;
+    lastReconnectAttempt = 0;
+    WLED::instance().initConnection();
   }
 
   // Long press: toggle the WiFi soft AP via WLED's own AP machinery.
   // Sets apBehavior so WLED's connection handler respects the intent across reconnects.
   // Blue blink = AP ON, red blink = AP OFF.
   void toggleAP() {
-    if (isApOn()) {
-      // Tear down AP the same way WLED does on STA connect.
-      stopAPNow();
-      apBehavior = AP_BEHAVIOR_BUTTON_ONLY;  // prevent WLED from re-opening it
-      apForcedOff = true;
-      startBlink(0x00FF0000, 3);  // red  = AP OFF
+    if (wirelessDisabled || !isApOn()) {
+      enableWireless();
+      startBlink(0x000000FF, 3);  // blue = wireless ON
     } else {
-      apBehavior = AP_BEHAVIOR_ALWAYS;        // tell WLED to keep AP open
-      WLED::instance().initAP();
-      apForcedOff = false;
-      startBlink(0x000000FF, 3);  // blue = AP ON
+      disableWireless();
+      startBlink(0x00FF0000, 3);  // red = wireless OFF
     }
-    DEBUG_PRINTF_P(PSTR("EspNowRemote: AP %s\n"), isApOn() ? "ON" : "OFF");
+    DEBUG_PRINTF_P(PSTR("EspNowRemote: wireless %s\n"), wirelessDisabled ? "OFF" : "ON");
   }
 
   void configurePins() {
@@ -564,6 +591,11 @@ class EspNowRemoteUsermod : public Usermod {
       sendHeartbeat();
     }
 
+    if (wirelessDisabled) {
+      lastReconnectAttempt = now;  // keep WLED from reopening WiFi on its own
+      forceReconnect = false;
+    }
+
     // ── Blink state machine ───────────────────────────────────────────────────
     updateBlink();
 
@@ -595,7 +627,8 @@ class EspNowRemoteUsermod : public Usermod {
         toggleAP();  // long press while held
       }
 
-      if (ctrlWaitSecond && (now - ctrlLastRelease) > ESPNOW_REMOTE_DBL_PRESS_MS) {
+      // Only resolve single-click once the button is released.
+      if (ctrlWaitSecond && !ctrlStable && (now - ctrlLastRelease) > ESPNOW_REMOTE_DBL_PRESS_MS) {
         ctrlWaitSecond = false;
         nextFavoritePreset();
       }

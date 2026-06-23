@@ -52,6 +52,8 @@
 #define ESPNOW_REMOTE_DEBOUNCE_MS   50       // debounce window in ms
 #define ESPNOW_REMOTE_LONG_PRESS_MS 2000UL   // hold duration for AP toggle
 #define ESPNOW_REMOTE_DBL_PRESS_MS  260UL    // max gap between short presses
+#define ESPNOW_REMOTE_CYCLE_PRESET    5      // preset that cycles 1..4
+#define ESPNOW_REMOTE_RADIO_OFF_PRESET 6     // preset that disables WiFi + ESP-NOW
 
 static const char espnowRemoteDefaultPresetsJson[] PROGMEM = R"json({
   "0": {},
@@ -59,7 +61,7 @@ static const char espnowRemoteDefaultPresetsJson[] PROGMEM = R"json({
     "n": "Idle Palette",
     "ql": "I",
     "on": true,
-    "bri": 120,
+    "bri": 60,
     "seg": [
       {
         "id": 0,
@@ -70,16 +72,21 @@ static const char espnowRemoteDefaultPresetsJson[] PROGMEM = R"json({
     ]
   },
   "2": {
-    "n": "Active Aurora",
+    "n": "Magenta Breathe",
     "ql": "A",
     "on": true,
-    "bri": 200,
+    "bri": 90,
     "seg": [
       {
         "id": 0,
-        "fx": 38,
-        "sx": 24,
-        "pal": 50
+        "fx": 2,
+        "sx": 40,
+        "ix": 180,
+        "col": [
+          [255, 0, 255],
+          [0, 0, 0],
+          [0, 0, 0]
+        ]
       }
     ]
   },
@@ -87,7 +94,7 @@ static const char espnowRemoteDefaultPresetsJson[] PROGMEM = R"json({
     "n": "Warm Static",
     "ql": "W",
     "on": true,
-    "bri": 160,
+    "bri": 80,
     "seg": [
       {
         "id": 0,
@@ -104,6 +111,18 @@ static const char espnowRemoteDefaultPresetsJson[] PROGMEM = R"json({
     "n": "Off",
     "ql": "O",
     "on": false
+  },
+  "5": {
+    "n": "Cycle 1-4",
+    "ql": "C",
+    "ps": "1~4~"
+  },
+  "6": {
+    "n": "Radio Off",
+    "ql": "R",
+    "EspNowRemote": {
+      "wireless": false
+    }
   }
 })json";
 
@@ -138,9 +157,9 @@ class EspNowRemoteUsermod : public Usermod {
 
   // Preset / effect shown while a peer heartbeat is being received
   uint8_t activePreset  = 0;   // 0 = use activeFx directly
-  uint8_t activeFx      = FX_MODE_AURORA;
-  uint8_t activeSpeed   = 24;  // Aurora default (sx=24 from FX.cpp)
-  uint8_t activePalette = 50;  // Aurora default (pal=50 from FX.cpp)
+  uint8_t activeFx      = FX_MODE_BREATH;
+  uint8_t activeSpeed   = 40;  // slower breathing for status visibility
+  uint8_t activePalette = 0;
 
   uint16_t timeoutSec   = 21;  // revert to idle after this many seconds without a heartbeat
   uint16_t transitionMs = 1500;
@@ -151,8 +170,9 @@ class EspNowRemoteUsermod : public Usermod {
   bool presenceInitDone = false;        // set after first effect is applied in loop()
   uint8_t lastPeerMac[6] = {};          // MAC of the most recent heartbeat sender
 
-  // ── Control button (single = next favorite, double = ESP-NOW, long = AP) ─────
-  int8_t        controlPin      = 9;   // GPIO9 = BOOT button on ESP32-C3 Super Mini
+  // ── Optional usermod control button (single = next favorite, double = ESP-NOW, long = AP) ─────
+  // Default off to avoid conflicts with WLED's built-in button handling.
+  int8_t        controlPin      = -1;
   bool          espNowListening = true;   // when false, incoming heartbeats are ignored and TX heartbeat is paused
 
   bool          ctrlRaw         = false;
@@ -182,6 +202,9 @@ class EspNowRemoteUsermod : public Usermod {
   uint8_t       blinkSavedSpd = 0;
   uint8_t       blinkSavedPal = 0;
   uint32_t      blinkSavedCol = 0;
+
+  enum PendingWirelessAction : uint8_t { PENDING_WIRELESS_NONE, PENDING_WIRELESS_DISABLE } pendingWirelessAction = PENDING_WIRELESS_NONE;
+  bool          pendingRadioFeedbackGreen = false;
 
   // ── Misc ─────────────────────────────────────────────────────────────────────
   unsigned long lastHeartbeat = 0;
@@ -368,9 +391,30 @@ class EspNowRemoteUsermod : public Usermod {
           seg.colors[0] = blinkSavedCol;
           stateUpdated(CALL_MODE_DIRECT_CHANGE);
           blinkPhase = BLINK_IDLE;
+
+          // Two-step radio feedback: red blink then green blink, then apply action.
+          if (pendingRadioFeedbackGreen) {
+            pendingRadioFeedbackGreen = false;
+            startBlink(0x0000FF00, 1); // green
+            return;
+          }
+          if (pendingWirelessAction == PENDING_WIRELESS_DISABLE) {
+            pendingWirelessAction = PENDING_WIRELESS_NONE;
+            disableWireless();
+          }
         }
         break;
       default: break;
+    }
+  }
+
+  // Queue radio disable with visual feedback: red -> green -> restore -> disable.
+  void queueWirelessDisableWithFeedback() {
+    if (wirelessDisabled || pendingWirelessAction == PENDING_WIRELESS_DISABLE) return;
+    pendingWirelessAction = PENDING_WIRELESS_DISABLE;
+    if (blinkPhase == BLINK_IDLE) {
+      pendingRadioFeedbackGreen = true;
+      startBlink(0x00FF0000, 1); // red
     }
   }
 
@@ -536,6 +580,30 @@ class EspNowRemoteUsermod : public Usermod {
     if (controlPin >= 0) pinMode(controlPin, INPUT_PULLUP);
   }
 
+  // Use WLED's built-in button macros to avoid double-handling the same physical button.
+  // Only assigns defaults when macros are still unset.
+  void ensureBuiltinButtonPresetActions() {
+    if (buttons.empty()) return;
+
+    Button &btn0 = buttons[0];
+    if (btn0.pin < 0 || btn0.type == BTN_TYPE_NONE) return;
+
+    bool changed = false;
+    if (btn0.macroButton == 0) {
+      btn0.macroButton = ESPNOW_REMOTE_CYCLE_PRESET;
+      changed = true;
+    }
+    if (btn0.macroLongPress == 0) {
+      btn0.macroLongPress = ESPNOW_REMOTE_RADIO_OFF_PRESET;
+      changed = true;
+    }
+
+    if (changed) {
+      DEBUG_PRINTF_P(PSTR("EspNowRemote: BTN0 macros set (short=%u long=%u)\n"),
+        (unsigned)btn0.macroButton, (unsigned)btn0.macroLongPress);
+    }
+  }
+
   // Apply the idle or active visual state.
   // Uses a preset if configured (> 0), otherwise sets the effect directly.
   void applyPresenceEffect(bool active) {
@@ -553,6 +621,9 @@ class EspNowRemoteUsermod : public Usermod {
       seg.setMode(fxId, true);
       seg.speed   = speed;
       seg.palette = palette;
+      if (active && fxId == FX_MODE_BREATH) {
+        seg.colors[0] = RGBW32(255, 0, 255, 0); // magenta
+      }
       stateUpdated(CALL_MODE_DIRECT_CHANGE);
     }
 
@@ -577,6 +648,7 @@ class EspNowRemoteUsermod : public Usermod {
     apForcedOff = false;
 
     configurePins();
+    ensureBuiltinButtonPresetActions();
     seedDefaultPresetsIfEmpty();
   }
 
@@ -598,6 +670,12 @@ class EspNowRemoteUsermod : public Usermod {
 
     // ── Blink state machine ───────────────────────────────────────────────────
     updateBlink();
+
+    // If another blink was active when disable was requested, start feedback once idle.
+    if (pendingWirelessAction == PENDING_WIRELESS_DISABLE && blinkPhase == BLINK_IDLE && !pendingRadioFeedbackGreen) {
+      pendingRadioFeedbackGreen = true;
+      startBlink(0x00FF0000, 1); // red
+    }
 
     // ── Control button (single = next favorite, double = ESP-NOW, long = AP) ─
     if (controlPin >= 0) {
@@ -700,6 +778,19 @@ class EspNowRemoteUsermod : public Usermod {
     return false;
   }
 
+  // Accept usermod-specific commands embedded in a preset/state JSON object.
+  // Example: {"EspNowRemote":{"wireless":false}}
+  void readFromJsonState(JsonObject& root) override {
+    JsonObject cmd = root[FPSTR(_name)];
+    if (cmd.isNull()) return;
+
+    if (!cmd["wireless"].isNull()) {
+      bool wantWireless = cmd["wireless"].as<bool>();
+      if (wantWireless && wirelessDisabled) enableWireless();
+      if (!wantWireless) queueWirelessDisableWithFeedback();
+    }
+  }
+
   // ── Config serialisation ──────────────────────────────────────────────────────
 
   void addToConfig(JsonObject& root) override {
@@ -752,11 +843,18 @@ class EspNowRemoteUsermod : public Usermod {
     configComplete &= getJsonValue(top["idlePreset"],   idlePreset,    (uint8_t)0);
     configComplete &= getJsonValue(top["activePreset"], activePreset,  (uint8_t)0);
     configComplete &= getJsonValue(top["idleFx"],       idleFx,        (uint8_t)FX_MODE_PALETTE);
-    configComplete &= getJsonValue(top["activeFx"],     activeFx,      (uint8_t)FX_MODE_AURORA);
+    configComplete &= getJsonValue(top["activeFx"],     activeFx,      (uint8_t)FX_MODE_BREATH);
     configComplete &= getJsonValue(top["idleSpeed"],    idleSpeed,     (uint8_t)20);
-    configComplete &= getJsonValue(top["activeSpeed"],  activeSpeed,   (uint8_t)24);
+    configComplete &= getJsonValue(top["activeSpeed"],  activeSpeed,   (uint8_t)40);
     configComplete &= getJsonValue(top["idlePal"],      idlePalette,   (uint8_t)0);
-    configComplete &= getJsonValue(top["activePal"],    activePalette, (uint8_t)50);
+    configComplete &= getJsonValue(top["activePal"],    activePalette, (uint8_t)0);
+
+    // Migrate earlier defaults (Aurora) to the new magenta breathing fallback.
+    if (activePreset == 0 && activeFx == FX_MODE_AURORA && activeSpeed == 24 && activePalette == 50) {
+      activeFx = FX_MODE_BREATH;
+      activeSpeed = 40;
+      activePalette = 0;
+    }
     configComplete &= getJsonValue(top["timeoutSec"],   timeoutSec,    (uint16_t)45);
     configComplete &= getJsonValue(top["transMs"],      transitionMs,  (uint16_t)1500);
     configComplete &= getJsonValue(top["controlPin"],   controlPin,    (int8_t)-1);

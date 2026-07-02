@@ -30,14 +30,22 @@ static constexpr uint16_t ADV_INTERVAL = 1600;
 // in some regions — reduce if that matters for your deployment.
 static constexpr int TX_POWER_DBM = 20;
 
-// LED strip wiring
-static constexpr int  LED_PIN   = 48; // onboard WS2812B on lolin_s3_mini
-static constexpr int  NUM_LEDS  = 10;
+// LED strip wiring. Override per board from platformio.ini build_flags
+// (e.g. -DLED_PIN=10 -DNUM_LEDS=1); the defaults below target the lolin_s3_mini.
+#ifndef LED_PIN
+#define LED_PIN 48          // WS2812B data GPIO (48 = onboard LED on lolin_s3_mini)
+#endif
+#ifndef NUM_LEDS
+#define NUM_LEDS 10         // strip length
+#endif
 static constexpr uint8_t BRIGHTNESS = 60; // global FastLED brightness (0–255)
 
-// BOOT button (GPIO0, active-low) toggles the radio on a long press.
-static constexpr int      BOOT_BUTTON_PIN = 0;
-static constexpr uint32_t LONG_PRESS_MS   = 1000; // hold this long to toggle
+// BOOT button (active-low) toggles the radio on a long press. GPIO0 on most
+// ESP32-S3 boards; GPIO9 on most ESP32-C3 boards incl. the Seeed Xiao C3.
+#ifndef BOOT_BUTTON_PIN
+#define BOOT_BUTTON_PIN 0
+#endif
+static constexpr uint32_t LONG_PRESS_MS = 1000; // hold this long to toggle
 
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -242,9 +250,9 @@ void loop() {
 
   if (!nearby) {
     // Idle: slowly cycling rainbow spread across the strip (WLED-style).
-    // 256 / NUM_LEDS spaces one full spectrum evenly over all pixels; idleHue
-    // shifts the whole pattern each frame to make it rotate.
-    fill_rainbow(leds, NUM_LEDS, idleHue, 256 / NUM_LEDS);
+    // 255 / NUM_LEDS spaces ~one full spectrum over all pixels (255 keeps the
+    // delta within uint8_t even at NUM_LEDS=1); idleHue rotates it each frame.
+    fill_rainbow(leds, NUM_LEDS, idleHue, 255 / NUM_LEDS);
   } else if (smoothRSSI >= RSSI_NEAR) {
     // Close: pulsing magenta. beatsin8 is a sine wave driven by millis():
     // 40 bpm → a full breathe every ~1.5 s, ramping brightness 40↔255.
